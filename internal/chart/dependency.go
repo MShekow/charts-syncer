@@ -7,6 +7,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/mkmik/multierror"
 	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/provenance"
 	"io/ioutil"
 	"k8s.io/klog"
@@ -84,13 +85,19 @@ func GetChartDependencies(filepath string, name string) ([]*chart.Dependency, er
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-
-	// No dependencies found
-	if lock == nil {
-		return nil, nil
+	if lock != nil {
+		return lock.Dependencies, nil
 	}
 
-	return lock.Dependencies, nil
+	// Try fallback from the dependencies
+	metadata, err := chartutil.LoadChartfile(path.Join(chartPath, ChartFilename))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if metadata.Dependencies != nil {
+		return metadata.Dependencies, nil
+	}
+	return nil, nil
 }
 
 // GetLockAPIVersion returns the apiVersion field of a chart's lock file
@@ -111,7 +118,7 @@ func GetLockAPIVersion(chartPath string) (string, error) {
 
 // BuildDependencies updates the chart dependencies and their repository references in the provided chart path
 //
-// It reads the lock file to download the versions from the target chart repository
+// It reads the lock file (or, if unavailable, the Chart.yaml file) to download the versions from the target chart repository
 func BuildDependencies(chartPath string, r client.ChartsReader, sourceRepo, targetRepo *api.Repo, t map[uint32]client.ChartsReaderWriter, syncTrusted, ignoreTrusted []*api.Repo) error {
 
 	// Build deps manually for OCI as helm does not support it yet
@@ -134,8 +141,22 @@ func BuildDependencies(chartPath string, r client.ChartsReader, sourceRepo, targ
 	if err != nil {
 		return errors.Trace(err)
 	}
+
+	var depsFromMetadata []*chart.Dependency
 	if apiVersion == "" {
-		return nil
+		// Neither a Chart.lock nor requirements.lock file exist, but if the Chart.yaml has V2 API version, the
+		// dependencies are still declared in the Chart.yaml itself
+		metadata, err := chartutil.LoadChartfile(path.Join(chartPath, ChartFilename))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if metadata.APIVersion == chart.APIVersionV2 {
+			apiVersion = APIV2
+			depsFromMetadata = metadata.Dependencies
+		} else {
+			return nil
+		}
+
 	}
 
 	switch apiVersion {
@@ -152,9 +173,16 @@ func BuildDependencies(chartPath string, r client.ChartsReader, sourceRepo, targ
 	}
 
 	// Step 2. Build charts/ folder
-	var errs error
+	var deps []*chart.Dependency
 	if lock != nil {
-		for _, dep := range lock.Dependencies {
+		deps = lock.Dependencies
+	} else if depsFromMetadata != nil {
+		deps = depsFromMetadata
+	}
+	var errs error
+
+	if deps != nil {
+		for _, dep := range deps {
 			id := fmt.Sprintf("%s-%s", dep.Name, dep.Version)
 			klog.V(4).Infof("Building %q chart dependency", id)
 
@@ -228,8 +256,10 @@ func updateChartMetadataFile(chartPath string, lock *chart.Lock, sourceRepo, tar
 	if err := writeChartFile(dest, chartMetadata); err != nil {
 		return errors.Trace(err)
 	}
-	if err := updateLockFile(chartPath, lock, chartMetadata.Dependencies, sourceRepo, targetRepo, false, syncTrusted, ignoreTrusted); err != nil {
-		return errors.Trace(err)
+	if lock != nil {
+		if err := updateLockFile(chartPath, lock, chartMetadata.Dependencies, sourceRepo, targetRepo, false, syncTrusted, ignoreTrusted); err != nil {
+			return errors.Trace(err)
+		}
 	}
 	return nil
 }
